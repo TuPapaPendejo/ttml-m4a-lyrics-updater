@@ -192,174 +192,133 @@ def format_credit_time(value: str) -> str:
 
 
 def extract_ttml_credits(root: ET.Element) -> list[str]:
-    """Extrae créditos y metadatos informativos presentes en el TTML.
+    """Extrae exclusivamente campos no vacíos del elemento iTunesMetadata.
 
-    No inventa roles: songwriter se muestra como songwriter/autor, y sólo
-    se etiqueta como compositor cuando el XML contiene ese campo.
+    La extracción es genérica: no depende de una lista fija de nombres de
+    campo. Conserva atributos con valor y texto de cualquier descendiente,
+    agrupa listas homogéneas (p. ej. varios <songwriter>) y omite nodos vacíos.
+    No incorpora xml:lang/itunes:timing del elemento <tt>, datos de <body>
+    ni agentes TTML de <head> que estén fuera de iTunesMetadata.
     """
     result: list[str] = []
     seen: set[str] = set()
 
-    def add_line(label: str, value: str) -> None:
-        value = clean_metadata_value(value)
-        if not value:
-            return
-        line = f"{label}: {value}"
-        key = line.casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(line)
+    def nonempty_attributes(element: ET.Element) -> list[tuple[str, str]]:
+        values: list[tuple[str, str]] = []
+        for raw_name, raw_value in element.attrib.items():
+            value = clean_metadata_value(raw_value)
+            if value:
+                values.append((local_name(raw_name), value))
+        return values
 
-    # Idioma y tipo de sincronización declarados en <tt>.
-    language = get_attr_by_local(root, "lang")
-    timing = get_attr_by_local(root, "timing")
-    if language:
-        add_line("Idioma TTML", language)
-    if timing:
-        add_line("Sincronización TTML", timing)
+    def attrs_suffix(attributes: list[tuple[str, str]]) -> str:
+        if not attributes:
+            return ""
+        return " (" + "; ".join(f"{name}={value}" for name, value in attributes) + ")"
 
-    # Duración declarada en <body dur="...">.
-    for element in root.iter():
-        if local_name(element.tag).casefold() == "body":
-            duration = get_attr_by_local(element, "dur")
-            if duration:
-                add_line("Duración TTML", duration)
-            break
+    def has_content(element: ET.Element) -> bool:
+        if clean_metadata_value(element.text) or nonempty_attributes(element):
+            return True
+        return any(has_content(child) for child in list(element))
 
-    # Metadatos propios de Apple Music. Se recogen los textos de sus nodos
-    # hoja; para contenedores como <songwriters>, se agrupan los nombres.
+    def render_element(element: ET.Element, depth: int = 0) -> list[str]:
+        """Renderiza un campo de metadata, omitiendo subárboles vacíos."""
+        label = metadata_label(local_name(element.tag))
+        own_text = clean_metadata_value(element.text)
+        attributes = nonempty_attributes(element)
+        children = [child for child in list(element) if has_content(child)]
+        indent = "  " * depth
+        suffix = attrs_suffix(attributes)
+
+        if not children:
+            if own_text:
+                return [f"{indent}{label}{suffix}: {own_text}"]
+            if attributes:
+                return [f"{indent}{label}{suffix}"]
+            return []
+
+        lines: list[str] = []
+        if own_text:
+            lines.append(f"{indent}{label}{suffix}: {own_text}")
+        elif attributes:
+            lines.append(f"{indent}{label}{suffix}")
+
+        # Caso común: <songwriters><songwriter>...</songwriter>...</songwriters>.
+        # Se agrupan valores repetidos sin fijar nombres de campo permitidos.
+        child_names = {local_name(child.tag).casefold() for child in children}
+        all_simple_text_leaves = all(
+            not list(child)
+            and bool(clean_metadata_value(child.text))
+            and not nonempty_attributes(child)
+            for child in children
+        )
+        if len(child_names) == 1 and all_simple_text_leaves:
+            values: list[str] = []
+            for child in children:
+                value = clean_metadata_value(child.text)
+                if value not in values:
+                    values.append(value)
+            if not own_text and not attributes:
+                return [f"{indent}{label}: {'; '.join(values)}"]
+            lines.append(f"{indent}  {metadata_label(local_name(children[0].tag))}: {'; '.join(values)}")
+            return lines
+
+        # Contenedores con estructuras más complejas conservan la jerarquía.
+        if not own_text and not attributes:
+            lines.append(f"{indent}{label}:")
+        for child in children:
+            lines.extend(render_element(child, depth + 1))
+        return lines
+
     for container in root.iter():
         if local_name(container.tag).casefold() != "itunesmetadata":
             continue
 
-        leading_silence = get_attr_by_local(container, "leadingSilence")
-        if leading_silence is not None:
-            add_line("Silencio inicial", f"{leading_silence} s")
-
-        grouped: dict[str, list[str]] = {}
-
-        def walk_metadata(node: ET.Element, parent_group: str | None = None) -> None:
-            node_name = local_name(node.tag)
-            normalized_name = node_name.casefold()
-            children = list(node)
-            own_text = clean_metadata_value(node.text)
-            if own_text:
-                label_source = parent_group or node_name
-                grouped.setdefault(metadata_label(label_source), []).append(own_text)
-
-            if not children:
-                return
-
-            next_group = node_name
-            for child in children:
-                walk_metadata(child, next_group)
+        # Los atributos de iTunesMetadata también forman parte de su contenido.
+        for attr_name, attr_value in nonempty_attributes(container):
+            line = f"{metadata_label(attr_name)}: {attr_value}"
+            if line.casefold() not in seen:
+                seen.add(line.casefold())
+                result.append(line)
 
         for child in list(container):
-            # El contenedor vacío <translations/> no aporta un valor que se
-            # pueda representar en ©lyr, por lo que se omite.
-            if local_name(child.tag).casefold() == "translations" and not list(child) and not clean_metadata_value(child.text):
-                continue
-            walk_metadata(child)
-
-        for label, values in grouped.items():
-            unique_values: list[str] = []
-            for value in values:
-                if value not in unique_values:
-                    unique_values.append(value)
-            add_line(label, "; ".join(unique_values))
-
-    # Agentes TTML: conservamos el ID y el tipo (p. ej. v1/person) para que
-    # el nombre no se confunda con un compositor o artista principal.
-    for agent in root.iter():
-        if local_name(agent.tag).casefold() != "agent":
-            continue
-        agent_id = get_attr_by_local(agent, "id")
-        agent_type = get_attr_by_local(agent, "type")
-        names: list[str] = []
-        for child in agent.iter():
-            if local_name(child.tag).casefold() == "name":
-                value = collect_text(child)
-                if value and value not in names:
-                    name_type = get_attr_by_local(child, "type")
-                    names.append(f"{value} ({name_type})" if name_type else value)
-        if names:
-            descriptor = "Agente TTML"
-            if agent_id:
-                descriptor += f" {agent_id}"
-            if agent_type:
-                descriptor += f" ({agent_type})"
-            add_line(descriptor, "; ".join(names))
-
-    # Secciones declaradas mediante itunes:songPart en <div>. Se conservan
-    # sus rangos cuando el TTML proporciona begin y end.
-    section_labels = {
-        "verse": "Verso",
-        "chorus": "Coro",
-        "pre-chorus": "Pre-coro",
-        "post-chorus": "Post-coro",
-        "bridge": "Puente",
-        "intro": "Intro",
-        "outro": "Outro",
-        "refrain": "Estribillo",
-        "hook": "Hook",
-        "interlude": "Interludio",
-        "instrumental": "Instrumental",
-        "breakdown": "Breakdown",
-    }
-    sections: dict[str, list[str]] = {}
-    for element in root.iter():
-        part = get_attr_by_local(element, "songPart")
-        if not part:
-            continue
-        label = section_labels.get(part.casefold(), part)
-        begin = get_attr_by_local(element, "begin")
-        end = get_attr_by_local(element, "end")
-        if begin and end:
-            try:
-                segment = f"{format_credit_time(begin)}–{format_credit_time(end)}"
-            except ValueError:
-                segment = f"{begin}–{end}"
-        elif begin:
-            try:
-                segment = f"desde {format_credit_time(begin)}"
-            except ValueError:
-                segment = f"desde {begin}"
-        else:
-            segment = ""
-        sections.setdefault(label, [])
-        if segment and segment not in sections[label]:
-            sections[label].append(segment)
-
-    for label, ranges in sections.items():
-        if ranges:
-            add_line(f"Sección {label}", "; ".join(ranges))
-        else:
-            add_line("Sección", label)
+            for line in render_element(child):
+                key = line.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(line)
 
     return result
 
 
 def iter_lyric_paragraphs(root: ET.Element):
-    """Recorre los párrafos p en orden XML e hereda itunes:songPart.
+    """Recorre <p> en orden XML e informa su sección y contenedor <div>.
 
-    Apple Music suele declarar songPart en un <div>. Cada elemento que declara
-    el atributo inicia su propio bloque, incluso si repite un valor anterior.
-    Un contenedor interno con songPart reemplaza al bloque heredado.
+    El identificador del div permite preservar una línea en blanco entre
+    bloques TTML, incluso cuando un div no declara itunes:songPart o cuando
+    se repite el mismo valor de songPart en dos divs consecutivos.
     """
-    def walk(node: ET.Element, inherited_section: tuple[ET.Element, str] | None):
+    def walk(
+        node: ET.Element,
+        inherited_section: tuple[ET.Element, str] | None,
+        current_div: ET.Element | None,
+    ):
+        if local_name(node.tag).casefold() == "div":
+            current_div = node
+
         song_part = get_attr_by_local(node, "songPart")
         if song_part is not None:
             value = clean_metadata_value(song_part)
             inherited_section = (node, value) if value else None
 
         if local_name(node.tag).casefold() == "p":
-            yield node, inherited_section
+            yield node, inherited_section, current_div
             return
 
         for child in list(node):
-            yield from walk(child, inherited_section)
+            yield from walk(child, inherited_section, current_div)
 
-    yield from walk(root, None)
+    yield from walk(root, None, None)
 
 
 def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int, list[str]]:
@@ -372,7 +331,8 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
     lines: list[str] = []
     skipped_without_begin = 0
     last_section_element: ET.Element | None = None
-    for element, section in iter_lyric_paragraphs(root):
+    last_div_element: ET.Element | None = None
+    for element, section, div_element in iter_lyric_paragraphs(root):
         begin = element.attrib.get("begin")
         if begin is None:
             # Algunas variantes pueden declarar un p sin begin; no inventamos
@@ -384,6 +344,14 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
             continue
 
         lyric_seconds = parse_ttml_time(begin)
+
+        # Cada bloque <div> comienza con una separación visual. Esto conserva
+        # el espacio entre secciones incluso si el TTML omite songPart en algún
+        # div o reutiliza el mismo valor de songPart en divs consecutivos.
+        if div_element is not None and div_element is not last_div_element:
+            if lines and lines[-1] != "":
+                lines.append("")
+            last_div_element = div_element
 
         # Inserta itunes:songPart como una línea LRC sincronizada. El instante
         # preferido es el begin del <div> que contiene la sección. Para que el

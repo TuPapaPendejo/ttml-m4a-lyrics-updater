@@ -3,6 +3,8 @@
 """Actualiza exclusivamente el átomo ©lyr de archivos M4A usando TTML.
 
 - Convierte begin de TTML a marcas LRC [MM:SS.cc].
+- Inserta el valor de itunes:songPart como encabezado antes de cada sección
+  cuando cambia el tipo (por ejemplo, intro, verse, chorus).
 - Acepta reloj TTML (MM:SS.mmm / HH:MM:SS.mmm), segundos decimales
   sin unidad (por ejemplo 7.627) y offsets con unidades h, m, s y ms.
 - No decodifica ni vuelve a codificar el audio.
@@ -336,6 +338,29 @@ def extract_ttml_credits(root: ET.Element) -> list[str]:
     return result
 
 
+def iter_lyric_paragraphs(root: ET.Element):
+    """Recorre los párrafos p en orden XML e hereda itunes:songPart.
+
+    Apple Music suele declarar songPart en un <div>. Cada elemento que declara
+    el atributo inicia su propio bloque, incluso si repite un valor anterior.
+    Un contenedor interno con songPart reemplaza al bloque heredado.
+    """
+    def walk(node: ET.Element, inherited_section: tuple[ET.Element, str] | None):
+        song_part = get_attr_by_local(node, "songPart")
+        if song_part is not None:
+            value = clean_metadata_value(song_part)
+            inherited_section = (node, value) if value else None
+
+        if local_name(node.tag).casefold() == "p":
+            yield node, inherited_section
+            return
+
+        for child in list(node):
+            yield from walk(child, inherited_section)
+
+    yield from walk(root, None)
+
+
 def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int, list[str]]:
     try:
         raw = ttml_path.read_bytes()
@@ -345,9 +370,8 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
 
     lines: list[str] = []
     skipped_without_begin = 0
-    for element in root.iter():
-        if local_name(element.tag).lower() != "p":
-            continue
+    last_section_element: ET.Element | None = None
+    for element, section in iter_lyric_paragraphs(root):
         begin = element.attrib.get("begin")
         if begin is None:
             # Algunas variantes pueden declarar un p sin begin; no inventamos
@@ -357,10 +381,19 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
         lyric = collect_text(element)
         if not lyric:
             continue
+
+        # Inserta el valor puro de itunes:songPart como encabezado al comenzar
+        # una sección o cuando cambia el valor. No escribe el nombre del atributo.
+        if section is not None and section[0] is not last_section_element:
+            if lines:
+                lines.append("")
+            lines.append(section[1])
+        last_section_element = section[0] if section is not None else None
+
         timestamp = format_lrc_timestamp(parse_ttml_time(begin))
         lines.append(f"{timestamp}{lyric}")
 
-    if not lines:
+    if not any(line.startswith("[") for line in lines):
         detail = f"; {skipped_without_begin} elemento(s) p sin begin" if skipped_without_begin else ""
         raise ValueError(f"El TTML no contiene párrafos p con begin y texto{detail}")
 
@@ -595,7 +628,7 @@ def main() -> int:
                 print(f"[SIN CAMBIOS ] {display}")
                 continue
 
-            first_line = lyrics.splitlines()[0] if lyrics else "(sin texto)"
+            first_line = next((line for line in lyrics.splitlines() if line.startswith("[")), "(sin texto)")
             print(f"[PENDIENTE   ] {display}")
             print(f"                {first_line[:150]}")
             if credits:

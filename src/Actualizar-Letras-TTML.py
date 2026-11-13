@@ -3,9 +3,11 @@
 """Actualiza exclusivamente el átomo ©lyr de archivos M4A usando TTML.
 
 - Convierte begin de TTML a marcas LRC [MM:SS.cc].
-- Inserta itunes:songPart como una línea LRC sincronizada antes de cada sección,
-  usando el begin del contenedor y anticipándolo 0.01 s si hace falta para que
-  el encabezado aparezca antes de la primera línea de la sección.
+- Inserta itunes:songPart como una línea LRC sincronizada antes de cada sección.
+- Representa los espacios entre bloques como líneas LRC vacías sincronizadas,
+  para que OpenLyrics no las reordene al final.
+- Sincroniza el bloque de créditos al final de la canción para que OpenLyrics
+  también lo muestre en su panel de letras sincronizadas.
 - Acepta reloj TTML (MM:SS.mmm / HH:MM:SS.mmm), segundos decimales
   sin unidad (por ejemplo 7.627) y offsets con unidades h, m, s y ms.
 - No decodifica ni vuelve a codificar el audio.
@@ -321,6 +323,45 @@ def iter_lyric_paragraphs(root: ET.Element):
     yield from walk(root, None, None)
 
 
+def get_body_duration(root: ET.Element) -> Decimal | None:
+    """Obtiene dur del primer <body>, si existe y es interpretable."""
+    for element in root.iter():
+        if local_name(element.tag).casefold() == "body":
+            value = get_attr_by_local(element, "dur")
+            if value:
+                try:
+                    return parse_ttml_time(value)
+                except ValueError:
+                    return None
+    return None
+
+
+def get_lrc_credit_times(
+    root: ET.Element,
+    last_lyric_boundary: Decimal | None,
+    credit_line_count: int,
+) -> list[Decimal]:
+    """Asigna tiempos LRC a los créditos para que OpenLyrics no los descarte.
+
+    OpenLyrics clasifica el texto no sincronizado después de la letra temporizada.
+    Se espacian los créditos 1 s y, cuando existe <body dur>, se colocan en el
+    tramo final disponible, pero nunca antes del límite de la última línea.
+    """
+    if credit_line_count <= 0:
+        return []
+
+    spacing = Decimal("1.00")
+    earliest = (last_lyric_boundary or Decimal(0)) + Decimal("0.05")
+    body_duration = get_body_duration(root)
+    if body_duration is not None:
+        preferred_start = body_duration - spacing * Decimal(credit_line_count)
+        start = max(earliest, preferred_start)
+    else:
+        start = earliest
+
+    return [start + spacing * Decimal(index) for index in range(credit_line_count)]
+
+
 def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int, list[str]]:
     try:
         raw = ttml_path.read_bytes()
@@ -332,8 +373,12 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
     skipped_without_begin = 0
     last_section_element: ET.Element | None = None
     last_div_element: ET.Element | None = None
+    have_lyric_block = False
+    lyric_begin_times: list[Decimal] = []
+    lyric_end_times: list[Decimal] = []
+
     for element, section, div_element in iter_lyric_paragraphs(root):
-        begin = element.attrib.get("begin")
+        begin = get_attr_by_local(element, "begin")
         if begin is None:
             # Algunas variantes pueden declarar un p sin begin; no inventamos
             # una marca de tiempo ni heredamos tiempos ambiguos del contenedor.
@@ -344,51 +389,81 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
             continue
 
         lyric_seconds = parse_ttml_time(begin)
+        lyric_begin_times.append(lyric_seconds)
+        end_value = get_attr_by_local(element, "end")
+        if end_value:
+            try:
+                lyric_end_times.append(parse_ttml_time(end_value))
+            except ValueError:
+                pass
 
-        # Cada bloque <div> comienza con una separación visual. Esto conserva
-        # el espacio entre secciones incluso si el TTML omite songPart en algún
-        # div o reutiliza el mismo valor de songPart en divs consecutivos.
-        if div_element is not None and div_element is not last_div_element:
-            if lines and lines[-1] != "":
-                lines.append("")
-            last_div_element = div_element
+        div_changed = div_element is not last_div_element
+        section_changed = section is not None and section[0] is not last_section_element
+        block_changed = div_changed or section_changed
 
-        # Inserta itunes:songPart como una línea LRC sincronizada. El instante
-        # preferido es el begin del <div> que contiene la sección. Para que el
-        # encabezado quede antes de su primera línea incluso cuando los tiempos
-        # del div y del primer p coinciden o se redondean igual, se usa como
-        # límite superior el instante del primer p menos una centésima.
-        # Si el div no tiene begin (o no se puede interpretar), se deriva del p.
-        if section is not None and section[0] is not last_section_element:
+        # El encabezado va ligeramente antes del primer p de su bloque. Si el
+        # div proporciona begin, se prefiere ese instante cuando es anterior.
+        section_marker_seconds = lyric_seconds - Decimal("0.01")
+        if section_changed:
             section_begin = get_attr_by_local(section[0], "begin")
-            marker_seconds = lyric_seconds - Decimal("0.01")
             if section_begin:
                 try:
-                    marker_seconds = min(parse_ttml_time(section_begin), marker_seconds)
+                    section_marker_seconds = min(
+                        parse_ttml_time(section_begin), section_marker_seconds
+                    )
                 except ValueError:
                     pass
-            if marker_seconds < 0:
-                marker_seconds = Decimal(0)
-            if lines and lines[-1] != "":
-                lines.append("")
-            marker_timestamp = format_lrc_timestamp(marker_seconds)
+        section_marker_seconds = max(Decimal(0), section_marker_seconds)
+
+        # IMPORTANTE PARA OPENLYRICS:
+        # No se emite una línea vacía sin timestamp. El parser LRC de OpenLyrics
+        # ordena todas las líneas sin tiempo al final del archivo. Un timestamp
+        # sin texto representa una línea visual vacía, pero permanece en su
+        # posición cronológica y el panel la dibuja como espacio entre bloques.
+        if have_lyric_block and block_changed:
+            gap_anchor = section_marker_seconds if section_changed else lyric_seconds - Decimal("0.01")
+            gap_seconds = max(Decimal(0), gap_anchor - Decimal("0.01"))
+            gap_timestamp = format_lrc_timestamp(gap_seconds)
+            anchor_timestamp = format_lrc_timestamp(gap_anchor)
+            if gap_timestamp != anchor_timestamp:
+                lines.append(gap_timestamp)  # Línea sincronizada vacía intencional.
+
+        # Inserta itunes:songPart como una línea LRC sincronizada antes de la
+        # primera letra de la sección.
+        if section_changed:
+            marker_timestamp = format_lrc_timestamp(section_marker_seconds)
             lines.append(f"{marker_timestamp}{section[1]}")
 
         last_section_element = section[0] if section is not None else None
+        last_div_element = div_element
+        have_lyric_block = True
 
         timestamp = format_lrc_timestamp(lyric_seconds)
         lines.append(f"{timestamp}{lyric}")
 
-    if not any(line.startswith("[") for line in lines):
+    if not lyric_begin_times or not any(line.startswith("[") for line in lines):
         detail = f"; {skipped_without_begin} elemento(s) p sin begin" if skipped_without_begin else ""
         raise ValueError(f"El TTML no contiene párrafos p con begin y texto{detail}")
 
-    # Se conserva el orden original de los párrafos TTML; esto evita reordenar
-    # líneas que se solapan temporalmente.
+    # Se conserva el orden temporal original de los párrafos TTML; esto evita
+    # reordenar líneas que se solapan temporalmente.
     credits = extract_ttml_credits(root) if include_credits else []
     if credits:
-        lines.extend(["", "[Créditos y metadatos TTML]"])
-        lines.extend(credits)
+        credit_block = ["[Créditos y metadatos TTML]", *credits]
+        # Para OpenLyrics, cada renglón del bloque final también necesita
+        # timestamp: de otro modo se clasifica como texto sin sincronizar y
+        # queda separado del resto de la línea de tiempo.
+        last_lyric_boundary = max(
+            lyric_end_times + lyric_begin_times
+        )
+        credit_times = get_lrc_credit_times(root, last_lyric_boundary, len(credit_block))
+        first_credit_time = credit_times[0]
+        separator_time = max(Decimal(0), first_credit_time - Decimal("0.01"))
+        if format_lrc_timestamp(separator_time) != format_lrc_timestamp(first_credit_time):
+            lines.append(format_lrc_timestamp(separator_time))
+        for credit_text, credit_time in zip(credit_block, credit_times):
+            lines.append(f"{format_lrc_timestamp(credit_time)}{credit_text}")
+
     return "\n".join(lines), skipped_without_begin, credits
 
 
@@ -586,7 +661,7 @@ def main() -> int:
     mode = "APLICAR CAMBIOS" if args.apply else "SIMULACIÓN (sin escribir)"
     print(f"\nBiblioteca : {root}")
     print(f"Modo       : {mode}")
-    print("Formato    : [MM:SS.cc] con tiempos begin del TTML")
+    print("Formato    : LRC sincronizado [MM:SS.cc], incluidos separadores y créditos")
     print(f"Créditos   : {'desactivados' if args.no_credits else 'añadidos al final de ©lyr cuando existan'}")
     print("Protección : respaldo + verificación de mdat + verificación de otros tags")
     print("-" * 92)

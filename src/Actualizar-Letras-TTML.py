@@ -3,8 +3,9 @@
 """Actualiza exclusivamente el átomo ©lyr de archivos M4A usando TTML.
 
 - Convierte begin de TTML a marcas LRC [MM:SS.cc].
-- Inserta el valor de itunes:songPart como encabezado antes de cada sección
-  cuando cambia el tipo (por ejemplo, intro, verse, chorus).
+- Inserta itunes:songPart como una línea LRC sincronizada antes de cada sección,
+  usando el begin del contenedor y anticipándolo 0.01 s si hace falta para que
+  el encabezado aparezca antes de la primera línea de la sección.
 - Acepta reloj TTML (MM:SS.mmm / HH:MM:SS.mmm), segundos decimales
   sin unidad (por ejemplo 7.627) y offsets con unidades h, m, s y ms.
 - No decodifica ni vuelve a codificar el audio.
@@ -382,15 +383,32 @@ def ttml_to_lrc(ttml_path: Path, include_credits: bool = True) -> tuple[str, int
         if not lyric:
             continue
 
-        # Inserta el valor puro de itunes:songPart como encabezado al comenzar
-        # una sección o cuando cambia el valor. No escribe el nombre del atributo.
+        lyric_seconds = parse_ttml_time(begin)
+
+        # Inserta itunes:songPart como una línea LRC sincronizada. El instante
+        # preferido es el begin del <div> que contiene la sección. Para que el
+        # encabezado quede antes de su primera línea incluso cuando los tiempos
+        # del div y del primer p coinciden o se redondean igual, se usa como
+        # límite superior el instante del primer p menos una centésima.
+        # Si el div no tiene begin (o no se puede interpretar), se deriva del p.
         if section is not None and section[0] is not last_section_element:
-            if lines:
+            section_begin = get_attr_by_local(section[0], "begin")
+            marker_seconds = lyric_seconds - Decimal("0.01")
+            if section_begin:
+                try:
+                    marker_seconds = min(parse_ttml_time(section_begin), marker_seconds)
+                except ValueError:
+                    pass
+            if marker_seconds < 0:
+                marker_seconds = Decimal(0)
+            if lines and lines[-1] != "":
                 lines.append("")
-            lines.append(section[1])
+            marker_timestamp = format_lrc_timestamp(marker_seconds)
+            lines.append(f"{marker_timestamp}{section[1]}")
+
         last_section_element = section[0] if section is not None else None
 
-        timestamp = format_lrc_timestamp(parse_ttml_time(begin))
+        timestamp = format_lrc_timestamp(lyric_seconds)
         lines.append(f"{timestamp}{lyric}")
 
     if not any(line.startswith("[") for line in lines):

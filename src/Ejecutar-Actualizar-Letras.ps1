@@ -8,7 +8,13 @@ param(
 
     [string]$LogPath = '',
 
-    [string]$Python = ''
+    [string]$Python = '',
+
+    [ValidateRange(1, 2147483647)]
+    [int]$BatchSize = 10,
+
+    [ValidateRange(0, 86400)]
+    [double]$BatchPauseSeconds = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +25,9 @@ if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
     throw "La carpeta de música no existe: $Root"
+}
+if ($BatchPauseSeconds -lt 0) {
+    throw '-BatchPauseSeconds no puede ser negativo.'
 }
 
 if ([string]::IsNullOrWhiteSpace($Python)) {
@@ -83,7 +92,8 @@ if ($MutagenCheck -ne 0) {
     }
 }
 
-$Arguments = @($ScriptPath, '--root', $Root)
+$BatchPauseInvariant = $BatchPauseSeconds.ToString([Globalization.CultureInfo]::InvariantCulture)
+$Arguments = @($ScriptPath, '--root', $Root, '--batch-size', $BatchSize, '--batch-pause-seconds', $BatchPauseInvariant)
 if ($Apply) {
     $Arguments += '--apply'
 }

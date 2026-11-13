@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Actualiza exclusivamente el átomo ©lyr de archivos M4A usando TTML.
+Versión 3.6: procesamiento por lotes estrictamente secuencial.
 
 - Convierte begin de TTML a marcas LRC [MM:SS.cc].
 - Inserta itunes:songPart como una línea LRC sincronizada antes de cada sección.
@@ -16,6 +17,8 @@
   * todos los demás tags Mutagen idénticos;
   * ©lyr exactamente igual al LRC generado.
 - No crea copias de seguridad persistentes.
+- Procesa archivos secuencialmente en lotes configurables; nunca ejecuta escrituras
+  concurrentes. Entre lotes aplica una pausa breve configurable.
 - Registra los errores con ruta absoluta del M4A y del TTML, mensaje y traceback
   en un archivo LOG dentro de la carpeta raíz (o en la ruta indicada).
 
@@ -27,12 +30,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
 import struct
 import sys
 import tempfile
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -676,7 +681,24 @@ def main() -> int:
         "--log-file",
         help="Ruta del log. Si se omite, se crea Actualizar-Letras_FECHA_HORA.log en la carpeta raíz.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Número máximo de archivos por lote secuencial (predeterminado: 10).",
+    )
+    parser.add_argument(
+        "--batch-pause-seconds",
+        type=float,
+        default=1.0,
+        help="Pausa entre lotes en segundos; use 0 para desactivarla (predeterminado: 1).",
+    )
     args = parser.parse_args()
+
+    if args.batch_size < 1:
+        parser.error("--batch-size debe ser un entero mayor o igual que 1")
+    if not math.isfinite(args.batch_pause_seconds) or args.batch_pause_seconds < 0:
+        parser.error("--batch-pause-seconds debe ser un número finito mayor o igual que 0")
 
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
@@ -696,6 +718,7 @@ def main() -> int:
     print(f"Créditos   : {'desactivados' if args.no_credits else 'añadidos al final de ©lyr cuando existan'}")
     print("Protección : archivo temporal + verificación de mdat + verificación de otros tags")
     print("Respaldos  : desactivados; no se crean copias persistentes")
+    print(f"Procesamiento: secuencial | lote={args.batch_size} archivo(s) | pausa={args.batch_pause_seconds:g} s")
     print(f"Log        : {log_path}")
     print("-" * 92)
 
@@ -712,63 +735,103 @@ def main() -> int:
         print(f"                  {type(exc).__name__}: {exc}")
 
     files = list(iter_m4a_files(root, onerror=on_walk_error))
+    # El orden estable hace reproducibles los lotes entre ejecuciones.
+    files.sort(key=lambda path: str(path.relative_to(root)).casefold())
     counts = {"PENDIENTE": 0, "ACTUALIZADO": 0, "SIN CAMBIOS": 0, "SIN TTML": 0, "ERROR": 0}
+    batch_count = (len(files) + args.batch_size - 1) // args.batch_size
 
-    for m4a_path in files:
-        display = relative_display(m4a_path, root)
-        ttml_path: Path | None = None
-        try:
-            ttml_path = find_ttml_for_m4a(m4a_path)
-            if ttml_path is None:
-                counts["SIN TTML"] += 1
-                print(f"[SIN TTML    ] {display}")
-                logger.info("SIN TTML | M4A=%s", m4a_path.resolve())
-                continue
+    logger.info(
+        "Plan de lotes | archivos=%d | lotes=%d | tamaño_lote=%d | pausa_segundos=%g | concurrencia=1",
+        len(files), batch_count, args.batch_size, args.batch_pause_seconds,
+    )
 
-            lyrics, skipped, credits = ttml_to_lrc(ttml_path, include_credits=not args.no_credits)
-            audio = MP4(str(m4a_path))
-            current_lyrics = get_lyrics_value(audio.tags)
-            if current_lyrics == lyrics:
-                counts["SIN CAMBIOS"] += 1
-                print(f"[SIN CAMBIOS ] {display}")
-                continue
+    for batch_number, batch_start in enumerate(range(0, len(files), args.batch_size), start=1):
+        batch_files = files[batch_start:batch_start + args.batch_size]
+        batch_counts = {key: 0 for key in counts}
+        batch_end_number = batch_start + len(batch_files)
 
-            first_line = next((line for line in lyrics.splitlines() if line.startswith("[")), "(sin texto)")
-            print(f"[PENDIENTE   ] {display}")
-            print(f"                {first_line[:150]}")
-            if credits:
-                print(f"                Créditos/metadatos: {len(credits)} campo(s)")
-                for credit_line in credits[:5]:
-                    print(f"                  {credit_line[:150]}")
-                if len(credits) > 5:
-                    print(f"                  ... y {len(credits) - 5} campo(s) más")
-            if skipped:
-                print(f"                Aviso: {skipped} párrafo(s) p sin begin fueron omitidos.")
+        print(f"LOTE {batch_number}/{batch_count} | archivos {batch_start + 1}-{batch_end_number} de {len(files)} | ejecución secuencial")
+        logger.info(
+            "LOTE %d/%d INICIO | rango=%d-%d | total_biblioteca=%d",
+            batch_number, batch_count, batch_start + 1, batch_end_number, len(files),
+        )
 
-            if args.apply:
-                write_updated_file(m4a_path, lyrics)
-                counts["ACTUALIZADO"] += 1
-                print("                Resultado: actualizado ©lyr; audio y demás tags verificados antes del reemplazo.")
-                logger.info("ACTUALIZADO | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
-            else:
-                counts["PENDIENTE"] += 1
-                logger.info("PENDIENTE (simulación) | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
-        except Exception as exc:
-            counts["ERROR"] += 1
-            m4a_full = str(m4a_path.resolve())
-            ttml_full = str(ttml_path.resolve()) if ttml_path is not None else "No localizado / no determinado"
-            print(f"[ERROR       ] {m4a_full}")
-            print(f"                TTML: {ttml_full}")
-            print(f"                {type(exc).__name__}: {exc}")
-            # El log incluye el traceback completo para identificar la línea que falló.
-            logger.exception(
-                "ERROR procesando archivo | M4A=%s | TTML=%s",
-                m4a_full, ttml_full,
-            )
+        for file_in_batch, m4a_path in enumerate(batch_files, start=1):
+            display = relative_display(m4a_path, root)
+            ttml_path: Path | None = None
+            try:
+                ttml_path = find_ttml_for_m4a(m4a_path)
+                if ttml_path is None:
+                    counts["SIN TTML"] += 1
+                    batch_counts["SIN TTML"] += 1
+                    print(f"[SIN TTML    ] [{file_in_batch}/{len(batch_files)}] {display}")
+                    logger.info("SIN TTML | M4A=%s", m4a_path.resolve())
+                    continue
+
+                lyrics, skipped, credits = ttml_to_lrc(ttml_path, include_credits=not args.no_credits)
+                audio = MP4(str(m4a_path))
+                current_lyrics = get_lyrics_value(audio.tags)
+                del audio  # Libera la referencia antes de procesar el siguiente M4A.
+                if current_lyrics == lyrics:
+                    counts["SIN CAMBIOS"] += 1
+                    batch_counts["SIN CAMBIOS"] += 1
+                    print(f"[SIN CAMBIOS ] [{file_in_batch}/{len(batch_files)}] {display}")
+                    logger.info("SIN CAMBIOS | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
+                    continue
+
+                first_line = next((line for line in lyrics.splitlines() if line.startswith("[")), "(sin texto)")
+                print(f"[PENDIENTE   ] [{file_in_batch}/{len(batch_files)}] {display}")
+                print(f"                {first_line[:150]}")
+                if credits:
+                    print(f"                Créditos/metadatos: {len(credits)} campo(s)")
+                    for credit_line in credits[:5]:
+                        print(f"                  {credit_line[:150]}")
+                    if len(credits) > 5:
+                        print(f"                  ... y {len(credits) - 5} campo(s) más")
+                if skipped:
+                    print(f"                Aviso: {skipped} párrafo(s) p sin begin fueron omitidos.")
+
+                if args.apply:
+                    write_updated_file(m4a_path, lyrics)
+                    counts["ACTUALIZADO"] += 1
+                    batch_counts["ACTUALIZADO"] += 1
+                    print("                Resultado: actualizado ©lyr; audio y demás tags verificados antes del reemplazo.")
+                    logger.info("ACTUALIZADO | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
+                else:
+                    counts["PENDIENTE"] += 1
+                    batch_counts["PENDIENTE"] += 1
+                    logger.info("PENDIENTE (simulación) | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
+            except Exception as exc:
+                counts["ERROR"] += 1
+                batch_counts["ERROR"] += 1
+                m4a_full = str(m4a_path.resolve())
+                ttml_full = str(ttml_path.resolve()) if ttml_path is not None else "No localizado / no determinado"
+                print(f"[ERROR       ] {m4a_full}")
+                print(f"                TTML: {ttml_full}")
+                print(f"                {type(exc).__name__}: {exc}")
+                # El log incluye el traceback completo para identificar la línea que falló.
+                logger.exception(
+                    "ERROR procesando archivo | M4A=%s | TTML=%s",
+                    m4a_full, ttml_full,
+                )
+
+        batch_summary = " | ".join(f"{key}={batch_counts[key]}" for key in counts)
+        print(f"FIN LOTE {batch_number}/{batch_count} | {batch_summary}")
+        logger.info("LOTE %d/%d FIN | %s", batch_number, batch_count, batch_summary)
+        for handler in logger.handlers:
+            handler.flush()
+
+        # Descanso breve configurable entre lotes. Dentro de cada lote y entre
+        # todos sus archivos sólo existe un único flujo de trabajo activo.
+        if batch_number < batch_count and args.batch_pause_seconds > 0:
+            print(f"Pausa entre lotes: {args.batch_pause_seconds:g} s")
+            time.sleep(args.batch_pause_seconds)
 
     print("-" * 92)
     print("RESUMEN")
     print(f"  M4A encontrados : {len(files)}")
+    print(f"  Lotes           : {batch_count} (tamaño máximo {args.batch_size})")
+    print("  Concurrencia    : 1 (secuencial)")
     for label in ("PENDIENTE", "ACTUALIZADO", "SIN CAMBIOS", "SIN TTML", "ERROR"):
         print(f"  {label:<14}: {counts[label]}")
     print(f"  Log             : {log_path}")
@@ -779,8 +842,8 @@ def main() -> int:
         print("\nNo se modificó ningún archivo. Revisa los resultados; para escribir, agrega -Apply al lanzador.")
 
     logger.info(
-        "Resumen | M4A=%d | PENDIENTE=%d | ACTUALIZADO=%d | SIN_CAMBIOS=%d | SIN_TTML=%d | ERROR=%d",
-        len(files), counts["PENDIENTE"], counts["ACTUALIZADO"],
+        "Resumen | M4A=%d | LOTES=%d | PENDIENTE=%d | ACTUALIZADO=%d | SIN_CAMBIOS=%d | SIN_TTML=%d | ERROR=%d",
+        len(files), batch_count, counts["PENDIENTE"], counts["ACTUALIZADO"],
         counts["SIN CAMBIOS"], counts["SIN TTML"], counts["ERROR"],
     )
     for handler in list(logger.handlers):

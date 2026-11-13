@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime logs and temporary files
+Actualizar-Letras_*.log
+*.log
+.ttml_lyrics_*.tmp
+
+# User music / lyric assets (never commit a music library)
+*.m4a
+*.m4b
+*.mp4
+*.mp3
+*.flac
+*.wav
+*.dsf
+*.dff
+*.ttml
+*.lrc
+*.srt
+*.txt.tmp
+
+# Legacy backup folders made by early versions
+_TTML_LYRICS_BACKUP_*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

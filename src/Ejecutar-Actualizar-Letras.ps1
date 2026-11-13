@@ -6,6 +6,8 @@ param(
 
     [switch]$NoCredits,
 
+    [string]$LogPath = '',
+
     [string]$Python = ''
 )
 
@@ -87,6 +89,9 @@ if ($Apply) {
 }
 if ($NoCredits) {
     $Arguments += '--no-credits'
+}
+if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+    $Arguments += @('--log-file', $LogPath)
 }
 
 if ($UsePyLauncher) {

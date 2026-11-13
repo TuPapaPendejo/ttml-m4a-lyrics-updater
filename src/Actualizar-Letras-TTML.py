@@ -15,7 +15,9 @@
   * hash idéntico del payload de todos los átomos MP4 mdat;
   * todos los demás tags Mutagen idénticos;
   * ©lyr exactamente igual al LRC generado.
-- Crea una copia de seguridad completa antes del reemplazo.
+- No crea copias de seguridad persistentes.
+- Registra los errores con ruta absoluta del M4A y del TTML, mensaje y traceback
+  en un archivo LOG dentro de la carpeta raíz (o en la ruta indicada).
 
 El modo predeterminado es simulación. Para escribir, use --apply.
 """
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -563,7 +566,7 @@ def find_ttml_for_m4a(m4a_path: Path) -> Path | None:
     try:
         names = {entry.name.casefold(): entry for entry in m4a_path.parent.iterdir() if entry.is_file()}
     except OSError:
-        return None
+        raise
     for name in (m4a_path.stem + ".ttml", m4a_path.name + ".ttml"):
         found = names.get(name.casefold())
         if found is not None:
@@ -571,8 +574,8 @@ def find_ttml_for_m4a(m4a_path: Path) -> Path | None:
     return None
 
 
-def iter_m4a_files(root: Path):
-    for current, dirs, files in os.walk(root):
+def iter_m4a_files(root: Path, onerror=None):
+    for current, dirs, files in os.walk(root, onerror=onerror):
         dirs[:] = [d for d in dirs if not d.startswith(BACKUP_PREFIX)]
         for filename in files:
             if filename.lower().endswith(".m4a"):
@@ -586,8 +589,13 @@ def relative_display(path: Path, root: Path) -> str:
         return str(path)
 
 
-def write_updated_file(m4a_path: Path, lyrics: str, root: Path, backup_root: Path) -> None:
-    # 1. Captura estado inicial; si no podemos validarlo, no tocamos el archivo.
+def write_updated_file(m4a_path: Path, lyrics: str) -> None:
+    """Actualiza ©lyr usando un temporal validado, sin crear respaldo persistente.
+
+    El original sólo se sustituye después de verificar el temporal completo.
+    El temporal está en la misma carpeta para que os.replace no cruce volúmenes.
+    """
+    # 1. Captura el estado original; si no podemos validarlo, no tocamos el archivo.
     original_audio = MP4(str(m4a_path))
     before_tags = snapshot_non_lyrics_tags(original_audio.tags)
     before_mdat = mdat_payload_sha256(m4a_path)
@@ -597,7 +605,9 @@ def write_updated_file(m4a_path: Path, lyrics: str, root: Path, backup_root: Pat
 
     temp_name: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(prefix=".ttml_lyrics_", suffix=".tmp", dir=str(m4a_path.parent), delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            prefix=".ttml_lyrics_", suffix=".tmp", dir=str(m4a_path.parent), delete=False
+        ) as temp_file:
             temp_name = temp_file.name
         temp_path = Path(temp_name)
         shutil.copy2(m4a_path, temp_path)
@@ -608,7 +618,7 @@ def write_updated_file(m4a_path: Path, lyrics: str, root: Path, backup_root: Pat
         edited_audio.tags[LYRICS_KEY] = [lyrics]
         edited_audio.save()
 
-        # 2. Valida el temporal antes de sustituir el original.
+        # 2. Valida el temporal ANTES de sustituir el original.
         check_audio = MP4(str(temp_path))
         if get_lyrics_value(check_audio.tags) != lyrics:
             raise ValueError("La lectura posterior no coincide con la letra LRC escrita en ©lyr")
@@ -618,30 +628,41 @@ def write_updated_file(m4a_path: Path, lyrics: str, root: Path, backup_root: Pat
         if after_mdat != before_mdat:
             raise ValueError("El contenido mdat cambió; se cancela el reemplazo para proteger el audio")
 
-        # 3. Copia de seguridad completa y reemplazo atómico.
-        relative = m4a_path.relative_to(root)
-        backup_path = backup_root / relative
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(m4a_path, backup_path)
+        # 3. Sustitución atómica. No se conserva una segunda copia completa.
+        # Si os.replace falla, el archivo original permanece en su ubicación.
         os.replace(temp_path, m4a_path)
         temp_name = None
-
-        # 4. Verificación del archivo ya reemplazado. Si algo falla, restaura backup.
-        final_audio = MP4(str(m4a_path))
-        final_ok = (
-            get_lyrics_value(final_audio.tags) == lyrics
-            and snapshot_non_lyrics_tags(final_audio.tags) == before_tags
-            and mdat_payload_sha256(m4a_path) == before_mdat
-        )
-        if not final_ok:
-            shutil.copy2(backup_path, m4a_path)
-            raise ValueError("Falló la verificación final; se restauró automáticamente la copia original")
     finally:
         if temp_name:
             try:
                 Path(temp_name).unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def create_run_logger(root: Path, requested_path: str | None) -> tuple[logging.Logger, Path]:
+    """Crea un log UTF-8; por defecto queda en la raíz de la biblioteca."""
+    if requested_path:
+        log_path = Path(requested_path).expanduser()
+        if not log_path.is_absolute():
+            log_path = root / log_path
+        log_path = log_path.resolve()
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        log_path = root / f"Actualizar-Letras_{stamp}.log"
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("ttml_lyrics_update")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(handler)
+    return logger, log_path
 
 
 def main() -> int:
@@ -651,6 +672,10 @@ def main() -> int:
     parser.add_argument("--root", required=True, help="Carpeta raíz que contiene la biblioteca M4A/TTML")
     parser.add_argument("--apply", action="store_true", help="Escribe los cambios; sin esta opción sólo simula")
     parser.add_argument("--no-credits", action="store_true", help="No añade créditos/metadatos TTML al final de ©lyr")
+    parser.add_argument(
+        "--log-file",
+        help="Ruta del log. Si se omite, se crea Actualizar-Letras_FECHA_HORA.log en la carpeta raíz.",
+    )
     args = parser.parse_args()
 
     root = Path(args.root).expanduser().resolve()
@@ -658,27 +683,46 @@ def main() -> int:
         print(f"ERROR: La carpeta no existe o no es accesible: {root}", file=sys.stderr)
         return 2
 
+    try:
+        logger, log_path = create_run_logger(root, args.log_file)
+    except OSError as exc:
+        print(f"ERROR: No se pudo crear el log en {root}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
     mode = "APLICAR CAMBIOS" if args.apply else "SIMULACIÓN (sin escribir)"
     print(f"\nBiblioteca : {root}")
     print(f"Modo       : {mode}")
     print("Formato    : LRC sincronizado [MM:SS.cc], incluidos separadores y créditos")
     print(f"Créditos   : {'desactivados' if args.no_credits else 'añadidos al final de ©lyr cuando existan'}")
-    print("Protección : respaldo + verificación de mdat + verificación de otros tags")
+    print("Protección : archivo temporal + verificación de mdat + verificación de otros tags")
+    print("Respaldos  : desactivados; no se crean copias persistentes")
+    print(f"Log        : {log_path}")
     print("-" * 92)
 
-    files = list(iter_m4a_files(root))
+    logger.info("Inicio | modo=%s | raíz=%s | créditos=%s", mode, root, not args.no_credits)
+    logger.info("Log completo: %s", log_path)
+
+    def on_walk_error(exc: OSError) -> None:
+        failed_path = str(Path(exc.filename).resolve()) if getattr(exc, "filename", None) else str(root)
+        logger.error(
+            "ERROR explorando directorio | ruta=%s | %s: %s",
+            failed_path, type(exc).__name__, exc,
+        )
+        print(f"[ERROR DIRECTORIO] {failed_path}")
+        print(f"                  {type(exc).__name__}: {exc}")
+
+    files = list(iter_m4a_files(root, onerror=on_walk_error))
     counts = {"PENDIENTE": 0, "ACTUALIZADO": 0, "SIN CAMBIOS": 0, "SIN TTML": 0, "ERROR": 0}
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_root = root / f"{BACKUP_PREFIX}{timestamp}"
-    backup_root_created = False
 
     for m4a_path in files:
         display = relative_display(m4a_path, root)
+        ttml_path: Path | None = None
         try:
             ttml_path = find_ttml_for_m4a(m4a_path)
             if ttml_path is None:
                 counts["SIN TTML"] += 1
                 print(f"[SIN TTML    ] {display}")
+                logger.info("SIN TTML | M4A=%s", m4a_path.resolve())
                 continue
 
             lyrics, skipped, credits = ttml_to_lrc(ttml_path, include_credits=not args.no_credits)
@@ -702,30 +746,47 @@ def main() -> int:
                 print(f"                Aviso: {skipped} párrafo(s) p sin begin fueron omitidos.")
 
             if args.apply:
-                if not backup_root_created:
-                    backup_root.mkdir(parents=True, exist_ok=True)
-                    backup_root_created = True
-                write_updated_file(m4a_path, lyrics, root, backup_root)
+                write_updated_file(m4a_path, lyrics)
                 counts["ACTUALIZADO"] += 1
-                print("                Resultado: actualizado ©lyr; audio y demás tags verificados.")
+                print("                Resultado: actualizado ©lyr; audio y demás tags verificados antes del reemplazo.")
+                logger.info("ACTUALIZADO | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
             else:
                 counts["PENDIENTE"] += 1
+                logger.info("PENDIENTE (simulación) | M4A=%s | TTML=%s", m4a_path.resolve(), ttml_path.resolve())
         except Exception as exc:
             counts["ERROR"] += 1
-            print(f"[ERROR       ] {display}")
+            m4a_full = str(m4a_path.resolve())
+            ttml_full = str(ttml_path.resolve()) if ttml_path is not None else "No localizado / no determinado"
+            print(f"[ERROR       ] {m4a_full}")
+            print(f"                TTML: {ttml_full}")
             print(f"                {type(exc).__name__}: {exc}")
+            # El log incluye el traceback completo para identificar la línea que falló.
+            logger.exception(
+                "ERROR procesando archivo | M4A=%s | TTML=%s",
+                m4a_full, ttml_full,
+            )
 
     print("-" * 92)
     print("RESUMEN")
     print(f"  M4A encontrados : {len(files)}")
     for label in ("PENDIENTE", "ACTUALIZADO", "SIN CAMBIOS", "SIN TTML", "ERROR"):
         print(f"  {label:<14}: {counts[label]}")
-    if backup_root_created:
-        print(f"  Respaldos       : {backup_root}")
+    print(f"  Log             : {log_path}")
     if args.apply:
-        print("\nProceso terminado. Conserva los respaldos hasta comprobar los archivos en tu reproductor.")
+        print("\nProceso terminado. No se crearon respaldos persistentes.")
+        print("El archivo temporal de trabajo se elimina al terminar cada actualización.")
     else:
         print("\nNo se modificó ningún archivo. Revisa los resultados; para escribir, agrega -Apply al lanzador.")
+
+    logger.info(
+        "Resumen | M4A=%d | PENDIENTE=%d | ACTUALIZADO=%d | SIN_CAMBIOS=%d | SIN_TTML=%d | ERROR=%d",
+        len(files), counts["PENDIENTE"], counts["ACTUALIZADO"],
+        counts["SIN CAMBIOS"], counts["SIN TTML"], counts["ERROR"],
+    )
+    for handler in list(logger.handlers):
+        handler.flush()
+        handler.close()
+        logger.removeHandler(handler)
 
     return 1 if counts["ERROR"] else 0
 

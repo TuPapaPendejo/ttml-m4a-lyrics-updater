@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Actualiza exclusivamente el átomo ©lyr de archivos M4A usando TTML.
-Versión 3.6: procesamiento por lotes estrictamente secuencial.
+Versión 3.7: selector interactivo de carpeta de origen; lotes secuenciales.
 
 - Convierte begin de TTML a marcas LRC [MM:SS.cc].
 - Inserta itunes:songPart como una línea LRC sincronizada antes de cada sección.

@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [string]$Root = 'D:\Música\Apple Music',
+    [string]$Root = '',
 
     [switch]$Apply,
 
@@ -20,12 +20,63 @@ param(
 $ErrorActionPreference = 'Stop'
 $ScriptPath = Join-Path $PSScriptRoot 'Actualizar-Letras-TTML.py'
 
+# -Root es opcional: sin él se abre el selector de carpetas de Windows.
+
 if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
     throw "No se encontró el script Python: $ScriptPath"
 }
-if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
-    throw "La carpeta de música no existe: $Root"
+# Si no se indicó -Root, permite elegir la carpeta de origen con un selector
+# nativo de Windows. La selección incluye todas las subcarpetas.
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $FolderDialog = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $FolderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $FolderDialog.Description = 'Selecciona la carpeta raíz que contiene los archivos M4A y sus TTML asociados.'
+        $FolderDialog.ShowNewFolderButton = $false
+
+        # Ubicación inicial sugerida; el usuario puede navegar a cualquier otra carpeta.
+        $InitialCandidates = @(
+            'D:\Música\Apple Music',
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::MyMusic),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        )
+        foreach ($Candidate in $InitialCandidates) {
+            if (-not [string]::IsNullOrWhiteSpace($Candidate) -and
+                (Test-Path -LiteralPath $Candidate -PathType Container)) {
+                $FolderDialog.SelectedPath = (Resolve-Path -LiteralPath $Candidate).Path
+                break
+            }
+        }
+
+        Write-Host 'Selecciona la carpeta raíz de la biblioteca M4A...' -ForegroundColor Cyan
+        $DialogResult = $FolderDialog.ShowDialog()
+        if ($DialogResult -ne [System.Windows.Forms.DialogResult]::OK -or
+            [string]::IsNullOrWhiteSpace($FolderDialog.SelectedPath)) {
+            Write-Host 'Selección cancelada. No se procesó ningún archivo.' -ForegroundColor Yellow
+            return
+        }
+        $Root = $FolderDialog.SelectedPath
+    }
+    catch {
+        Write-Warning "No se pudo abrir el selector de carpetas: $($_.Exception.Message)"
+        $Root = Read-Host 'Introduce la ruta completa de la carpeta raíz que contiene los M4A'
+        if ([string]::IsNullOrWhiteSpace($Root)) {
+            Write-Host 'No se indicó una carpeta. No se procesó ningún archivo.' -ForegroundColor Yellow
+            return
+        }
+    }
+    finally {
+        if ($null -ne $FolderDialog) {
+            $FolderDialog.Dispose()
+        }
+    }
 }
+
+if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+    throw "La carpeta de origen no existe o no es accesible: $Root"
+}
+$Root = (Resolve-Path -LiteralPath $Root).Path
 if ($BatchPauseSeconds -lt 0) {
     throw '-BatchPauseSeconds no puede ser negativo.'
 }
